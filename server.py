@@ -1,24 +1,23 @@
 import os
-from typing import Any, Dict
+from fastapi import FastAPI
+from fastmcp import FastMCP
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+# Create MCP server
+mcp = FastMCP("Gen OS Memory")
 
-app = FastAPI()
+# Create FastAPI app
+app = FastAPI(title="Gen OS MCP")
 
-BRIDGE_BASE_URL = os.environ.get(
-    "GEN_BRIDGE_BASE_URL",
-    "https://gen-os-memory-bridge-production.up.railway.app"
-).rstrip("/")
+# Mount MCP under /mcp
+app.mount("/mcp", mcp.streamable_http_app())
 
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "service": "gen-os-mcp",
-        "message": "Gen OS MCP wrapper online"
+        "service": "Gen OS MCP",
+        "message": "MCP wrapper online"
     }
 
 
