@@ -348,4 +348,4 @@ Gen Memory MCP
 
 # Export the MCP ASGI app directly.
 # This is the app Railway should run with uvicorn.
-app = mcp.http_app()
+app = mcp.http_app(path="/mcp/")
