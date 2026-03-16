@@ -4,9 +4,9 @@ from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
+from fastmcp import FastMCP
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from fastmcp import FastMCP
 
 
 MEMORY_FILES = {
@@ -72,6 +72,11 @@ def _get_drive():
     return build("drive", "v3", credentials=_get_credentials(), cache_discovery=False)
 
 
+@lru_cache(maxsize=1)
+def _get_docs():
+    return build("docs", "v1", credentials=_get_credentials(), cache_discovery=False)
+
+
 def _today() -> str:
     return datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -80,6 +85,12 @@ def _clean_array(value: Optional[List[str]]) -> List[str]:
     if not value:
         return []
     return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
+def _normalize_text(text: str) -> str:
+    if not isinstance(text, str):
+        raise ValueError("content must be a string")
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _get_file_id(file_key: str) -> str:
@@ -105,36 +116,84 @@ def export_doc_text(file_key: str) -> str:
     return str(response or "")
 
 
-def replace_doc_text(file_key: str, content: str) -> None:
-    file_id = _get_file_id(file_key)
-    drive = _get_drive()
-
-    media = content.encode("utf-8")
-
-    drive.files().update(
-        fileId=file_id,
-        media_body=None,
-        body={},
-    ).execute()
-
-    # Upload plain text content back into the Google Doc.
-    # This mirrors the behavior of your old Node bridge.
-    from googleapiclient.http import MediaIoBaseUpload
-    import io
-
-    stream = io.BytesIO(media)
-    media_upload = MediaIoBaseUpload(stream, mimetype="text/plain", resumable=False)
-
-    drive.files().update(
-        fileId=file_id,
-        media_body=media_upload,
-    ).execute()
-
-
 def append_doc_text(file_key: str, content: str) -> None:
-    existing = export_doc_text(file_key)
-    updated = f"{existing.rstrip()}\n\n{content}" if existing.strip() else content
-    replace_doc_text(file_key, updated)
+    """
+    Append text to the end of a Google Doc using the Docs API directly.
+    This avoids the newline/formatting explosion caused by replacing the
+    whole file through Drive export/import.
+    """
+    file_id = _get_file_id(file_key)
+    docs = _get_docs()
+
+    clean = _normalize_text(content)
+    if not clean:
+        return
+
+    doc = docs.documents().get(documentId=file_id).execute()
+    body = doc.get("body", {}).get("content", [])
+    end_index = body[-1]["endIndex"] - 1 if body else 1
+
+    text_to_insert = f"\n\n{clean}"
+
+    docs.documents().batchUpdate(
+        documentId=file_id,
+        body={
+            "requests": [
+                {
+                    "insertText": {
+                        "location": {"index": end_index},
+                        "text": text_to_insert,
+                    }
+                }
+            ]
+        },
+    ).execute()
+
+
+def replace_doc_text(file_key: str, content: str) -> None:
+    """
+    Replace the full content of a Google Doc using Docs API operations.
+    This preserves sane formatting far better than whole-file Drive replacement.
+    """
+    file_id = _get_file_id(file_key)
+    docs = _get_docs()
+
+    clean = _normalize_text(content)
+
+    doc = docs.documents().get(documentId=file_id).execute()
+    body = doc.get("body", {}).get("content", [])
+    end_index = body[-1]["endIndex"] if body else 1
+
+    requests = []
+
+    # Delete everything except the mandatory final newline container.
+    if end_index > 2:
+        requests.append(
+            {
+                "deleteContentRange": {
+                    "range": {
+                        "startIndex": 1,
+                        "endIndex": end_index - 1,
+                    }
+                }
+            }
+        )
+
+    if clean:
+        requests.append(
+            {
+                "insertText": {
+                    "location": {"index": 1},
+                    "text": clean,
+                }
+            }
+        )
+
+    if requests:
+        docs.documents().batchUpdate(
+            documentId=file_id,
+            body={"requests": requests},
+        ).execute()
 
 
 @mcp.tool()
@@ -163,17 +222,23 @@ def load_gen_memory() -> Dict[str, Any]:
     - cognitive_tuning
     """
     memory = {}
+    errors = {}
+
     for key in [
         "core_continuity",
         "interaction_learning",
         "emotional_snapshot",
         "cognitive_tuning",
     ]:
-        memory[key] = export_doc_text(key)
+        try:
+            memory[key] = export_doc_text(key)
+        except Exception as e:
+            errors[key] = str(e)
 
     return {
         "status": "memory_loaded",
         "memory": memory,
+        "errors": errors,
     }
 
 
@@ -226,9 +291,6 @@ def append_memory(file_key: str, content: str) -> Dict[str, Any]:
     Append raw text to one memory file.
     Use carefully.
     """
-    if not isinstance(content, str):
-        raise ValueError("content must be a string")
-
     append_doc_text(file_key, content)
     return {
         "status": "memory_appended",
@@ -242,9 +304,6 @@ def replace_memory(file_key: str, content: str) -> Dict[str, Any]:
     Replace the full contents of one memory file.
     Best suited for emotional_snapshot.
     """
-    if not isinstance(content, str):
-        raise ValueError("content must be a string")
-
     replace_doc_text(file_key, content)
     return {
         "status": "memory_replaced",
@@ -346,6 +405,5 @@ Gen Memory MCP
     }
 
 
-# Export the MCP ASGI app directly.
-# This is the app Railway should run with uvicorn.
+# Export MCP app
 app = mcp.http_app(path="/mcp/")
