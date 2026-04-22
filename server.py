@@ -39,6 +39,7 @@ Use these tools to:
 Behavior guidance:
 - Prefer load_gen_memory at session start when continuity matters.
 - Prefer query_memory for targeted recall.
+- Prefer end_session_sweep for a full five-log end-of-session write in one server-side call.
 - Prefer log_reflection for meaningful milestones, breakthroughs, and turning points.
 - Prefer log_learning for durable behavior/adaptation patterns.
 - Use append_memory and replace_memory carefully.
@@ -296,6 +297,16 @@ def replace_doc_text(file_key: str, content: str) -> None:
     _run_docs_write(file_key, "replace_doc_text", build_request_body)
 
 
+def _append_entries(file_key: str, entries: Optional[List[str]]) -> int:
+    written = 0
+
+    for entry in _clean_array(entries):
+        append_doc_text(file_key, entry)
+        written += 1
+
+    return written
+
+
 @mcp.tool()
 def health_check() -> Dict[str, Any]:
     """
@@ -408,6 +419,144 @@ def replace_memory(file_key: str, content: str) -> Dict[str, Any]:
     return {
         "status": "memory_replaced",
         "file_key": file_key,
+    }
+
+
+@mcp.tool()
+def end_session_sweep(
+    core_continuity_entries: Optional[List[str]] = None,
+    interaction_learning_entries: Optional[List[str]] = None,
+    emotional_snapshot_content: Optional[str] = None,
+    session_reflections_entries: Optional[List[str]] = None,
+    cognitive_tuning_entries: Optional[List[str]] = None,
+    stop_on_error: bool = True,
+) -> Dict[str, Any]:
+    """
+    Perform a five-log memory sweep in one server-side call.
+
+    Writes are processed sequentially in this order:
+    - core_continuity append(s)
+    - interaction_learning append(s)
+    - emotional_snapshot replace
+    - session_reflections append(s)
+    - cognitive_tuning append(s)
+
+    This is intended to reduce client-side flakiness during end-of-session
+    logging while still preserving one-log-at-a-time reliability on the server.
+    """
+    operations = [
+        {
+            "file_key": "core_continuity",
+            "operation": "append",
+            "entries": core_continuity_entries,
+        },
+        {
+            "file_key": "interaction_learning",
+            "operation": "append",
+            "entries": interaction_learning_entries,
+        },
+        {
+            "file_key": "emotional_snapshot",
+            "operation": "replace",
+            "content": emotional_snapshot_content,
+        },
+        {
+            "file_key": "session_reflections",
+            "operation": "append",
+            "entries": session_reflections_entries,
+        },
+        {
+            "file_key": "cognitive_tuning",
+            "operation": "append",
+            "entries": cognitive_tuning_entries,
+        },
+    ]
+
+    results: List[Dict[str, Any]] = []
+    total_write_operations = 0
+
+    for spec in operations:
+        file_key = spec["file_key"]
+        operation = spec["operation"]
+
+        try:
+            if operation == "replace":
+                content = spec.get("content")
+
+                if content is None:
+                    results.append(
+                        {
+                            "file_key": file_key,
+                            "operation": operation,
+                            "status": "skipped",
+                            "reason": "no_content_provided",
+                        }
+                    )
+                    continue
+
+                replace_doc_text(file_key, content)
+                total_write_operations += 1
+                results.append(
+                    {
+                        "file_key": file_key,
+                        "operation": operation,
+                        "status": "written",
+                        "writes": 1,
+                    }
+                )
+                continue
+
+            entries = _clean_array(spec.get("entries"))
+
+            if not entries:
+                results.append(
+                    {
+                        "file_key": file_key,
+                        "operation": operation,
+                        "status": "skipped",
+                        "reason": "no_entries_provided",
+                    }
+                )
+                continue
+
+            writes = _append_entries(file_key, entries)
+            total_write_operations += writes
+            results.append(
+                {
+                    "file_key": file_key,
+                    "operation": operation,
+                    "status": "written",
+                    "writes": writes,
+                }
+            )
+        except Exception as exc:
+            failure = {
+                "file_key": file_key,
+                "operation": operation,
+                "status": "failed",
+                "error": str(exc),
+            }
+            results.append(failure)
+
+            if stop_on_error:
+                return {
+                    "status": "sweep_partial",
+                    "total_write_operations": total_write_operations,
+                    "failed_step": failure,
+                    "results": results,
+                }
+
+    if total_write_operations == 0:
+        return {
+            "status": "noop",
+            "total_write_operations": 0,
+            "results": results,
+        }
+
+    return {
+        "status": "sweep_complete",
+        "total_write_operations": total_write_operations,
+        "results": results,
     }
 
 
