@@ -443,6 +443,7 @@ def end_session_sweep(
 
     This is intended to reduce client-side flakiness during end-of-session
     logging while still preserving one-log-at-a-time reliability on the server.
+    Any omitted or blank payload is skipped rather than forced.
     """
     operations = [
         {
@@ -494,7 +495,20 @@ def end_session_sweep(
                     )
                     continue
 
-                replace_doc_text(file_key, content)
+                clean_content = _normalize_text(content)
+
+                if not clean_content:
+                    results.append(
+                        {
+                            "file_key": file_key,
+                            "operation": operation,
+                            "status": "skipped",
+                            "reason": "blank_content_provided",
+                        }
+                    )
+                    continue
+
+                replace_doc_text(file_key, clean_content)
                 total_write_operations += 1
                 results.append(
                     {
