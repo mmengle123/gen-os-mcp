@@ -253,12 +253,20 @@ def append_doc_text(file_key: str, content: str) -> None:
     _run_docs_write(file_key, "append_doc_text", build_request_body)
 
 
-def replace_doc_text(file_key: str, content: str) -> None:
+def replace_doc_text(
+    file_key: str,
+    content: str,
+    *,
+    allow_empty: bool = False,
+) -> bool:
     """
     Replace the full content of a Google Doc using Docs API operations.
     This preserves sane formatting far better than whole-file Drive replacement.
     """
     clean = _normalize_text(content)
+
+    if not clean and not allow_empty:
+        return False
 
     def build_request_body(state: Dict[str, Any]) -> Dict[str, Any]:
         requests = []
@@ -295,6 +303,7 @@ def replace_doc_text(file_key: str, content: str) -> None:
         return body
 
     _run_docs_write(file_key, "replace_doc_text", build_request_body)
+    return True
 
 
 def _append_entries(file_key: str, entries: Optional[List[str]]) -> int:
@@ -410,12 +419,27 @@ def append_memory(file_key: str, content: str) -> Dict[str, Any]:
 
 
 @mcp.tool()
-def replace_memory(file_key: str, content: str) -> Dict[str, Any]:
+def replace_memory(
+    file_key: str,
+    content: str,
+    allow_empty: bool = False,
+) -> Dict[str, Any]:
     """
     Replace the full contents of one memory file.
     Best suited for emotional_snapshot.
+
+    Blank content is skipped by default to prevent accidental log erasure.
+    Set allow_empty=True only when you intentionally want to clear a file.
     """
-    replace_doc_text(file_key, content)
+    written = replace_doc_text(file_key, content, allow_empty=allow_empty)
+
+    if not written:
+        return {
+            "status": "skipped",
+            "file_key": file_key,
+            "reason": "blank_content_provided",
+        }
+
     return {
         "status": "memory_replaced",
         "file_key": file_key,
