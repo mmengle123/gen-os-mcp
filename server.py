@@ -1,5 +1,9 @@
 import json
+import logging
 import os
+import threading
+import time
+from collections import defaultdict
 from datetime import datetime
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -7,6 +11,7 @@ from typing import Any, Dict, List, Optional
 from fastmcp import FastMCP
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 MEMORY_FILES = {
@@ -40,6 +45,23 @@ Behavior guidance:
 """
 
 mcp = FastMCP("Gen Memory", instructions=instructions)
+logger = logging.getLogger("gen_memory")
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+
+MAX_DOC_WRITE_ATTEMPTS = 4
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+RETRYABLE_400_HINTS = (
+    "revision",
+    "stale",
+    "must be less than",
+    "out of bounds",
+    "index",
+)
+_doc_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
 def _normalize_private_key(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -100,6 +122,87 @@ def _get_file_id(file_key: str) -> str:
     return file_id
 
 
+def _get_doc_state(file_key: str) -> Dict[str, Any]:
+    file_id = _get_file_id(file_key)
+    docs = _get_docs()
+
+    doc = docs.documents().get(
+        documentId=file_id,
+        fields="body/content/endIndex,revisionId",
+    ).execute()
+
+    body = doc.get("body", {}).get("content", [])
+    end_index = body[-1].get("endIndex", 1) if body else 1
+
+    return {
+        "end_index": end_index,
+        "revision_id": doc.get("revisionId"),
+    }
+
+
+def _is_retryable_docs_error(exc: Exception) -> bool:
+    if not isinstance(exc, HttpError):
+        return False
+
+    status = getattr(exc.resp, "status", None)
+    if status in RETRYABLE_STATUS_CODES:
+        return True
+
+    if status == 400:
+        message = str(exc).lower()
+        return any(hint in message for hint in RETRYABLE_400_HINTS)
+
+    return False
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    return min(0.35 * (2 ** (attempt - 1)), 3.0)
+
+
+def _run_docs_write(
+    file_key: str,
+    operation_name: str,
+    build_request_body,
+) -> Dict[str, Any]:
+    file_id = _get_file_id(file_key)
+
+    with _doc_locks[file_key]:
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, MAX_DOC_WRITE_ATTEMPTS + 1):
+            try:
+                state = _get_doc_state(file_key)
+                body = build_request_body(state)
+
+                if not body.get("requests"):
+                    return {"status": "skipped", "reason": "no_requests"}
+
+                return _get_docs().documents().batchUpdate(
+                    documentId=file_id,
+                    body=body,
+                ).execute()
+            except Exception as exc:
+                last_error = exc
+
+                if attempt >= MAX_DOC_WRITE_ATTEMPTS or not _is_retryable_docs_error(exc):
+                    raise
+
+                delay = _retry_delay_seconds(attempt)
+                logger.warning(
+                    "Retrying %s for %s after attempt %s failed: %s",
+                    operation_name,
+                    file_key,
+                    attempt,
+                    exc,
+                )
+                time.sleep(delay)
+
+        if last_error:
+            raise last_error
+
+        raise RuntimeError(f"{operation_name} failed without an explicit error")
+
+
 def export_doc_text(file_key: str) -> str:
     file_id = _get_file_id(file_key)
     drive = _get_drive()
@@ -119,35 +222,34 @@ def export_doc_text(file_key: str) -> str:
 def append_doc_text(file_key: str, content: str) -> None:
     """
     Append text to the end of a Google Doc using the Docs API directly.
-    This avoids the newline/formatting explosion caused by replacing the
-    whole file through Drive export/import.
+    This avoids stale index races by targeting the current revision and
+    inserting at the document body's end instead of computing a hard index.
     """
-    file_id = _get_file_id(file_key)
-    docs = _get_docs()
-
     clean = _normalize_text(content)
     if not clean:
         return
 
-    doc = docs.documents().get(documentId=file_id).execute()
-    body = doc.get("body", {}).get("content", [])
-    end_index = body[-1]["endIndex"] - 1 if body else 1
-
-    text_to_insert = f"\n\n{clean}"
-
-    docs.documents().batchUpdate(
-        documentId=file_id,
-        body={
+    def build_request_body(state: Dict[str, Any]) -> Dict[str, Any]:
+        prefix = "\n\n" if state["end_index"] > 1 else ""
+        body: Dict[str, Any] = {
             "requests": [
                 {
                     "insertText": {
-                        "location": {"index": end_index},
-                        "text": text_to_insert,
+                        "endOfSegmentLocation": {},
+                        "text": f"{prefix}{clean}",
                     }
                 }
             ]
-        },
-    ).execute()
+        }
+
+        if state["revision_id"]:
+            body["writeControl"] = {
+                "targetRevisionId": state["revision_id"],
+            }
+
+        return body
+
+    _run_docs_write(file_key, "append_doc_text", build_request_body)
 
 
 def replace_doc_text(file_key: str, content: str) -> None:
@@ -155,45 +257,43 @@ def replace_doc_text(file_key: str, content: str) -> None:
     Replace the full content of a Google Doc using Docs API operations.
     This preserves sane formatting far better than whole-file Drive replacement.
     """
-    file_id = _get_file_id(file_key)
-    docs = _get_docs()
-
     clean = _normalize_text(content)
 
-    doc = docs.documents().get(documentId=file_id).execute()
-    body = doc.get("body", {}).get("content", [])
-    end_index = body[-1]["endIndex"] if body else 1
+    def build_request_body(state: Dict[str, Any]) -> Dict[str, Any]:
+        requests = []
 
-    requests = []
-
-    # Delete everything except the mandatory final newline container.
-    if end_index > 2:
-        requests.append(
-            {
-                "deleteContentRange": {
-                    "range": {
-                        "startIndex": 1,
-                        "endIndex": end_index - 1,
+        if state["end_index"] > 2:
+            requests.append(
+                {
+                    "deleteContentRange": {
+                        "range": {
+                            "startIndex": 1,
+                            "endIndex": state["end_index"] - 1,
+                        }
                     }
                 }
-            }
-        )
+            )
 
-    if clean:
-        requests.append(
-            {
-                "insertText": {
-                    "location": {"index": 1},
-                    "text": clean,
+        if clean:
+            requests.append(
+                {
+                    "insertText": {
+                        "location": {"index": 1},
+                        "text": clean,
+                    }
                 }
-            }
-        )
+            )
 
-    if requests:
-        docs.documents().batchUpdate(
-            documentId=file_id,
-            body={"requests": requests},
-        ).execute()
+        body: Dict[str, Any] = {"requests": requests}
+
+        if state["revision_id"]:
+            body["writeControl"] = {
+                "requiredRevisionId": state["revision_id"],
+            }
+
+        return body
+
+    _run_docs_write(file_key, "replace_doc_text", build_request_body)
 
 
 @mcp.tool()
